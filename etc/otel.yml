@@ -7,10 +7,6 @@ receivers:
         endpoint: "localhost:4317"
 
 processors:
-  batch:
-    send_batch_max_size: 1000
-    send_batch_size: 100
-    timeout: 1s
 
 exporters:
   logging:
@@ -22,8 +18,6 @@ service:
     traces:
       receivers:
         - otlp
-      processors:
-        - batch
       exporters:
         - awsxray
         - logging
