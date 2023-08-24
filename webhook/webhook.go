@@ -64,7 +64,7 @@ type Handler struct {
 	initMux             sync.Mutex
 	hasInitialized      bool
 	parameterPathPrefix string
-	params              *parameters
+	params              parameters
 }
 
 type parameters struct {
