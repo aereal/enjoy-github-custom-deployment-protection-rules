@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +20,12 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/bradleyfalzon/ghinstallation"
 	"github.com/google/go-github/v54/github"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -65,10 +68,12 @@ type Handler struct {
 	hasInitialized      bool
 	parameterPathPrefix string
 	params              parameters
+	ghAppID             int64
 }
 
 type parameters struct {
-	WebhookSecret string `ssmp:"/webhook_secret"`
+	WebhookSecret       string `ssmp:"/webhook_secret"`
+	GitHubAppPrivateKey string `ssmp:"/github_app_private_key"`
 }
 
 func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLRequest) (_ *events.LambdaFunctionURLResponse, err error) {
@@ -117,6 +122,10 @@ func (h *Handler) initialize(ctx context.Context) (err error) {
 	if h.parameterPathPrefix == "" {
 		return ErrParameterPathPrefixIsEmpty
 	}
+	h.ghAppID, err = strconv.ParseInt(os.Getenv("GH_APP_ID"), 10, 64)
+	if err != nil {
+		return fmt.Errorf("strconv.ParseInt: %w", err)
+	}
 
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -162,12 +171,23 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 	logger := log.FromContext(ctx)
 	switch payload := payload.(type) {
 	case *github.DeploymentProtectionRuleEvent:
+		var (
+			installationID int64
+			callbackURL    string
+			deployEnv      string
+		)
 		fields := []zap.Field{
 			zap.Stringp("environment", payload.Environment),
 			zap.Stringp("action", payload.Action),
 			zap.Stringp("deployment_callback_url", payload.DeploymentCallbackURL),
 		}
+		if payload.DeploymentCallbackURL != nil {
+			callbackURL = *payload.DeploymentCallbackURL
+		}
 		if inst := payload.Installation; inst != nil {
+			if inst.ID != nil {
+				installationID = *inst.ID
+			}
 			fields = append(fields,
 				zap.Int64p("installation.target_id", inst.TargetID),
 				zap.Stringp("installation.target_type", inst.TargetType),
@@ -177,6 +197,9 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 			fields = append(fields, zap.Stringp("sender.login", sender.Login))
 		}
 		if deploy := payload.Deployment; deploy != nil {
+			if deploy.Environment != nil {
+				deployEnv = *deploy.Environment
+			}
 			fields = append(fields,
 				zap.Stringp("deploy.sha", deploy.SHA),
 				zap.Stringp("deploy.ref", deploy.Ref),
@@ -186,6 +209,20 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 				zap.Int64p("deploy.id", deploy.ID))
 		}
 		logger.Info("receive deployment_protection_rule event", fields...)
+		tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, installationID, []byte(h.params.GitHubAppPrivateKey))
+		if err != nil {
+			return fmt.Errorf("ghinstallation.New: %w", err)
+		}
+		ghClient := github.NewClient(&http.Client{Transport: tr})
+		req, err := ghClient.NewRequest(http.MethodPost, callbackURL, map[string]any{"environment_name": deployEnv, "comment": "- received\n- **event**\n- [link to root](/)"})
+		if err != nil {
+			return fmt.Errorf("github.Client.NewRequest: %w", err)
+		}
+		resp, err := ghClient.Do(ctx, req, nil)
+		if err != nil {
+			return fmt.Errorf("github.Client.Do: %w", err)
+		}
+		logger.Info("receive response from GitHub", zap.Int("rate.limit", resp.Rate.Limit), zap.Int("rate.remaining", resp.Rate.Remaining), zap.Time("rate.reset_at", resp.Rate.Reset.Time), zap.Time("token_expiration", resp.TokenExpiration.Time))
 	default:
 		logger.Info("receive unknown webhook event", zap.String("github.webhook.go_type", fmt.Sprintf("%T", payload)))
 	}
