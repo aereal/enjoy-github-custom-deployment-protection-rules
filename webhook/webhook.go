@@ -3,20 +3,26 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aereal/enjoy-github-custom-deployment-protection-rules/log"
 	"github.com/aereal/enjoy-github-custom-deployment-protection-rules/observability"
+	"github.com/aereal/paramsenc"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/google/go-github/v54/github"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -41,17 +47,28 @@ var (
 		Headers:    map[string]string{"content-type": "application/json"},
 		Body:       `{"error":"not found"}`,
 	}
+
+	ErrParameterPathPrefixIsEmpty = errors.New("PARAMETER_PATH_PREFIX is empty")
 )
 
 func New() *Handler {
 	h := &Handler{
-		tracer: otel.GetTracerProvider().Tracer("github.com/aereal/enjoy-github-custom-deployment-protection-rules"),
+		tracer:              otel.GetTracerProvider().Tracer("github.com/aereal/enjoy-github-custom-deployment-protection-rules"),
+		parameterPathPrefix: os.Getenv("PARAMETER_PATH_PREFIX"),
 	}
 	return h
 }
 
 type Handler struct {
-	tracer trace.Tracer
+	tracer              trace.Tracer
+	initMux             sync.Mutex
+	hasInitialized      bool
+	parameterPathPrefix string
+	params              *parameters
+}
+
+type parameters struct {
+	WebhookSecret string `ssmp:"/webhook_secret"`
 }
 
 func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLRequest) (_ *events.LambdaFunctionURLResponse, err error) {
@@ -78,6 +95,50 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 }
 
+func (h *Handler) initialize(ctx context.Context) (err error) {
+	h.initMux.Lock()
+	defer h.initMux.Unlock()
+	if h.hasInitialized {
+		return nil
+	}
+
+	ctx, span := h.tracer.Start(ctx, "Handler.initialize")
+	defer func() {
+		code := codes.Ok
+		if err != nil {
+			code = codes.Error
+			span.RecordError(err)
+		}
+		span.SetStatus(code, "")
+		span.End()
+	}()
+
+	h.hasInitialized = true
+	if h.parameterPathPrefix == "" {
+		return ErrParameterPathPrefixIsEmpty
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("config.LoadDefaultConfig: %w", err)
+	}
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
+	client := ssm.NewFromConfig(cfg)
+	input := &ssm.GetParametersByPathInput{
+		Path:           &h.parameterPathPrefix,
+		Recursive:      ref(true),
+		WithDecryption: ref(true),
+	}
+	out, err := client.GetParametersByPath(ctx, input)
+	if err != nil {
+		return fmt.Errorf("ssm.Client.GetParametersByPath: %w", err)
+	}
+	if err := paramsenc.NewDecoder(out.Parameters, paramsenc.WithPathPrefix(h.parameterPathPrefix)).Decode(&h.params); err != nil {
+		return fmt.Errorf("paramsenc.Decoder.Decode: %w", err)
+	}
+	return nil
+}
+
 func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionURLRequest) (err error) {
 	ctx, span := h.tracer.Start(ctx, "Handler.handleWebhook")
 	defer func() {
@@ -90,7 +151,11 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		span.End()
 	}()
 
-	payload, err := parseAndValidateWebhookPayload(req, []byte("83a196e5cf55aeaf98e85c1eb08a0c14feb30ae6f7d9a8db79d20b705c7244ef"))
+	if err := h.initialize(ctx); err != nil {
+		return fmt.Errorf("Handler.initialize: %w", err)
+	}
+
+	payload, err := parseAndValidateWebhookPayload(req, []byte(h.params.WebhookSecret))
 	if err != nil {
 		return fmt.Errorf("parseAndValidateWebhookPayload: %w", err)
 	}
@@ -188,3 +253,5 @@ func Start() int {
 	lambda.StartWithOptions(otellambda.InstrumentHandler(h.Handle, opts...), lambda.WithContext(log.WithLogger(context.Background(), logger)))
 	return 0
 }
+
+func ref[T any](v T) *T { return &v }
