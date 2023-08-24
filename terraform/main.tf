@@ -13,6 +13,8 @@ locals {
   function_name = "gh-custom-deploy-protection"
 }
 
+data "aws_caller_identity" "current" {}
+
 resource "aws_lambda_function_url" "webhook" {
   function_name      = local.function_name
   authorization_type = "NONE"
@@ -62,6 +64,10 @@ data "aws_iam_policy_document" "allow_assume_from_lambda" {
   }
 }
 
+data "aws_kms_key" "parameter_encryption_key" {
+  key_id = var.parameter_encryption_key_id
+}
+
 data "aws_iam_policy_document" "webhook" {
   statement {
     actions = [
@@ -74,6 +80,14 @@ data "aws_iam_policy_document" "webhook" {
       "xray:PutTraceSegments",
     ]
     resources = ["*"]
+  }
+  statement {
+    actions   = ["kms:Decrypt"]
+    resources = [data.aws_kms_key.parameter_encryption_key.arn]
+  }
+  statement {
+    actions   = ["ssm:GetParametersByPath"]
+    resources = ["arn:aws:ssm:ap-northeast-1:${data.aws_caller_identity.current.account_id}:parameter${var.parameter_path_prefix}"]
   }
 }
 
