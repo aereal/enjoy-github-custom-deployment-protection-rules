@@ -170,6 +170,9 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 	}
 	logger := log.FromContext(ctx)
 	switch payload := payload.(type) {
+	case *github.PingEvent, *github.InstallationEvent, *github.InstallationRepositoriesEvent, *github.InstallationTargetEvent:
+		// noop
+		return nil
 	case *github.DeploymentProtectionRuleEvent:
 		var (
 			installationID int64
