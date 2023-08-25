@@ -255,7 +255,7 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		if err != nil {
 			return fmt.Errorf("extractRunID: %w", err)
 		}
-		tok, err := h.buildTransientToken(callbackURL, installationID, owner, repoName, runID)
+		tok, err := h.buildTransientToken(installationID, owner, repoName, runID)
 		if err != nil {
 			return fmt.Errorf("buildTransientToken: %w", err)
 		}
@@ -270,8 +270,9 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		ghClient := github.NewClient(&http.Client{Transport: tr})
 		reqBody := map[string]any{
 			"environment_name": deployEnv,
-			"comment":          fmt.Sprintf("read the docs.\n\n[approve this deployment](%s)", approvalURL),
+			"comment":          fmt.Sprintf("[approve](%s)", approvalURL),
 		}
+		logger.Info("send request to GitHub", zap.Int("request.comment.size", len(reqBody["comment"].(string))))
 		req, err := ghClient.NewRequest(http.MethodPost, callbackURL, reqBody)
 		if err != nil {
 			return fmt.Errorf("github.Client.NewRequest: %w", err)
@@ -307,16 +308,12 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 	return nil
 }
 
-func (h *Handler) buildTransientToken(reviewURL string, installationID int64, owner, repo string, runID int64) ([]byte, error) {
-	issuedAt := time.Now()
+func (h *Handler) buildTransientToken(installationID int64, owner, repo string, runID int64) ([]byte, error) {
 	tok, err := jwt.NewBuilder().
-		Issuer(issuer).
-		IssuedAt(issuedAt).
-		NotBefore(issuedAt.Add(grace*-1)).
-		Expiration(issuedAt.Add(availableDuration)).
-		Claim("github.back_url", fmt.Sprintf("https://github.com/%s/%s/actions/run/%d", owner, repo, runID)).
-		Claim("github.review_url", reviewURL).
-		Claim("github.installation_id", installationID).
+		Claim("repo.owner", owner).
+		Claim("repo.name", repo).
+		Claim("run_id", runID).
+		Claim("installation_id", installationID).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("jwt.Builder.Build: %w", err)
