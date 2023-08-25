@@ -111,10 +111,18 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		}
 		return respOK, nil
 	case "/approval":
-		if err := h.handleApproval(ctx, req); err != nil {
+		redirectURL, err := h.handleApproval(ctx, req)
+		if err != nil {
 			return respError, nil
 		}
-		return respOK, nil // TODO: redirect
+		return &events.LambdaFunctionURLResponse{
+			StatusCode: http.StatusSeeOther,
+			Headers: map[string]string{
+				"location":     redirectURL,
+				"content-type": "text/plain; charset=utf-8",
+			},
+			Body: fmt.Sprintf("redirect to %s\n", redirectURL),
+		}, nil
 	default:
 		return respNotFound, nil
 	}
@@ -289,7 +297,7 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 	return nil
 }
 
-func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionURLRequest) (err error) {
+func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionURLRequest) (_ string, err error) {
 	ctx, span := h.tracer.Start(ctx, "Handler.handleApproval")
 	defer func() {
 		code := codes.Ok
@@ -302,10 +310,60 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 	}()
 
 	logger := log.FromContext(ctx)
-	token := req.QueryStringParameters["token"]
-	logger.Info("handle /approval", zap.String("request_parameter.token", token))
+	raw := req.QueryStringParameters["token"]
+	logger = logger.With(zap.String("request_parameter.token", raw))
+	defer func() {
+		logger.Info("handle /approval")
+	}()
+	pubKey, err := h.params.tokenSigningKey.PublicKey()
+	if err != nil {
+		return "", fmt.Errorf("PublicKey: %w", err)
+	}
+	token, err := jwt.Parse([]byte(raw), jwt.WithKey(jwa.RS256, pubKey))
+	if err != nil {
+		return "", fmt.Errorf("jwt.Parse: %w", err)
+	}
+	var (
+		repo           string
+		runID          int64
+		installationID int64
+	)
+	if v, ok := token.Get("repo"); ok {
+		repo, _ = v.(string)
+	}
+	if v, ok := token.Get("run_id"); ok {
+		fv, _ := v.(float64)
+		runID = int64(fv)
+	}
+	if v, ok := token.Get("installation_id"); ok {
+		fv, _ := v.(float64)
+		installationID = int64(fv)
+	}
+	logger = logger.With(zap.String("repo", repo), zap.Int64("run_id", runID), zap.Int64("installation_id", installationID))
+	if repo == "" || runID == 0 || installationID == 0 {
+		return "", errors.New("missing parameter")
+	}
 
-	return nil
+	tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, installationID, []byte(h.params.GitHubAppPrivateKey))
+	if err != nil {
+		return "", fmt.Errorf("ghinstallation.New: %w", err)
+	}
+	ghClient := github.NewClient(&http.Client{Transport: tr})
+	reqBody := map[string]any{
+		"environment_name": "production", // TODO
+		"state":            "approved",
+	}
+	ghReq, err := ghClient.NewRequest(http.MethodPost, fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%d/deployment_protection_rule", repo, runID), reqBody)
+	if err != nil {
+		return "", fmt.Errorf("github.Client.NewRequest: %w", err)
+	}
+	resp, err := ghClient.Do(ctx, ghReq, nil)
+	if err != nil {
+		return "", fmt.Errorf("github.Client.Do: %w", err)
+	}
+	logger.Info("receive response from GitHub", zap.Int("rate.limit", resp.Rate.Limit), zap.Int("rate.remaining", resp.Rate.Remaining), zap.Time("rate.reset_at", resp.Rate.Reset.Time), zap.Time("token_expiration", resp.TokenExpiration.Time))
+
+	return fmt.Sprintf("https://github.com/%s/actions/runs/%d", repo, runID), nil
 }
 
 func (h *Handler) buildTransientToken(installationID int64, repo string, runID int64) ([]byte, error) {
