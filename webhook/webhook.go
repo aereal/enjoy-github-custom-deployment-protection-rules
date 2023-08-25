@@ -255,7 +255,7 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		if err != nil {
 			return fmt.Errorf("extractRunID: %w", err)
 		}
-		tok, err := h.buildTransientToken(installationID, owner, repoName, runID)
+		tok, err := h.buildTransientToken(installationID, fmt.Sprintf("%s/%s", owner, repoName), runID)
 		if err != nil {
 			return fmt.Errorf("buildTransientToken: %w", err)
 		}
@@ -308,10 +308,9 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 	return nil
 }
 
-func (h *Handler) buildTransientToken(installationID int64, owner, repo string, runID int64) ([]byte, error) {
+func (h *Handler) buildTransientToken(installationID int64, repo string, runID int64) ([]byte, error) {
 	tok, err := jwt.NewBuilder().
-		Claim("repo.owner", owner).
-		Claim("repo.name", repo).
+		Claim("repo", repo).
 		Claim("run_id", runID).
 		Claim("installation_id", installationID).
 		Build()
