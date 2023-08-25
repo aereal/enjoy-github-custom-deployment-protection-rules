@@ -74,6 +74,7 @@ type Handler struct {
 type parameters struct {
 	WebhookSecret       string `ssmp:"/webhook_secret"`
 	GitHubAppPrivateKey string `ssmp:"/github_app_private_key"`
+	TokenSigningKey     string `ssmp:"/token_signing_key"`
 }
 
 func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLRequest) (_ *events.LambdaFunctionURLResponse, err error) {
@@ -89,6 +90,9 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		logger.Info("processed request", zap.String("path", req.RawPath))
 	}()
 
+	if err := h.initialize(ctx); err != nil {
+		return respError, nil
+	}
 	switch req.RawPath {
 	case "/webhook":
 		if err := h.handleWebhook(ctx, req); err != nil {
@@ -159,10 +163,6 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		span.SetStatus(code, "")
 		span.End()
 	}()
-
-	if err := h.initialize(ctx); err != nil {
-		return fmt.Errorf("Handler.initialize: %w", err)
-	}
 
 	payload, err := parseAndValidateWebhookPayload(req, []byte(h.params.WebhookSecret))
 	if err != nil {
