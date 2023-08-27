@@ -62,6 +62,14 @@ func (c *Claims) validate() error {
 	return nil
 }
 
+func (c *Claims) asToken() (jwt.Token, error) {
+	return jwt.NewBuilder().
+		Claim("repo", c.Repo).
+		Claim("run_id", c.RunID).
+		Claim("installation_id", c.InstallationID).
+		Build()
+}
+
 func (av *ApprovalVerifier) IssueToken(ctx context.Context, claims *Claims) (_ string, err error) {
 	_, span := av.tracer.Start(ctx, "ApprovalVerifier.IssueToken")
 	defer func() {
@@ -78,11 +86,7 @@ func (av *ApprovalVerifier) IssueToken(ctx context.Context, claims *Claims) (_ s
 		return "", ErrSigningKeyRequired
 	}
 
-	tok, err := jwt.NewBuilder().
-		Claim("repo", claims.Repo).
-		Claim("run_id", claims.RunID).
-		Claim("installation_id", claims.InstallationID).
-		Build()
+	tok, err := claims.asToken()
 	if err != nil {
 		return "", fmt.Errorf("jwt.Builder.Build: %w", err)
 	}
