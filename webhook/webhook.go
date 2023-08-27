@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aereal/enjoy-github-custom-deployment-protection-rules/approvalreq"
 	"github.com/aereal/enjoy-github-custom-deployment-protection-rules/log"
 	"github.com/aereal/enjoy-github-custom-deployment-protection-rules/observability"
 	"github.com/aereal/paramsenc"
@@ -23,9 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/bradleyfalzon/ghinstallation"
 	"github.com/google/go-github/v54/github"
-	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jwt"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
@@ -54,9 +53,6 @@ var (
 		Headers:    map[string]string{"content-type": "application/json"},
 		Body:       `{"error":"not found"}`,
 	}
-	issuer            = "github.com/aereal/enjoy-github-custom-deployment-protection-rules"
-	grace             = time.Second * 30
-	availableDuration = time.Hour * 1
 
 	ErrParameterPathPrefixIsEmpty = errors.New("PARAMETER_PATH_PREFIX is empty")
 	ErrFunctionURLOriginRequired  = errors.New("FUNCTION_URL_ORIGIN is required")
@@ -78,6 +74,7 @@ type Handler struct {
 	params              parameters
 	ghAppID             int64
 	fnURLOrigin         string
+	approvalVerifier    *approvalreq.ApprovalVerifier
 }
 
 type parameters struct {
@@ -178,10 +175,11 @@ func (h *Handler) initialize(ctx context.Context) (err error) {
 		return fmt.Errorf("paramsenc.Decoder.Decode: %w", err)
 	}
 
-	h.params.tokenSigningKey, err = jwk.ParseKey([]byte(h.params.TokenSigningKeyString), jwk.WithPEM(true))
+	tokenSigningKey, err := jwk.ParseKey([]byte(h.params.TokenSigningKeyString), jwk.WithPEM(true))
 	if err != nil {
 		return fmt.Errorf("jwk.ParseKey: %w", err)
 	}
+	h.approvalVerifier = approvalreq.NewApprovalVerifier(approvalreq.WithSigningKey(tokenSigningKey))
 	return nil
 }
 
@@ -263,9 +261,14 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		if err != nil {
 			return fmt.Errorf("extractRunID: %w", err)
 		}
-		tok, err := h.buildTransientToken(installationID, fmt.Sprintf("%s/%s", owner, repoName), runID)
+		approvalClaims := &approvalreq.Claims{
+			InstallationID: installationID,
+			Repo:           fmt.Sprintf("%s/%s", owner, repoName),
+			RunID:          runID,
+		}
+		token, err := h.approvalVerifier.IssueToken(ctx, approvalClaims)
 		if err != nil {
-			return fmt.Errorf("buildTransientToken: %w", err)
+			return fmt.Errorf("ApprovalVerifier.IssueToken: %w", err)
 		}
 		approvalURL, err := url.Parse(h.fnURLOrigin)
 		if err != nil {
@@ -273,7 +276,7 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		}
 		approvalURL.Path = "/approval"
 		qs := approvalURL.Query()
-		qs.Set("token", string(tok))
+		qs.Set("token", token)
 		approvalURL.RawQuery = qs.Encode()
 		ghClient := github.NewClient(&http.Client{Transport: tr})
 		reqBody := map[string]any{
@@ -315,36 +318,13 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 	defer func() {
 		logger.Info("handle /approval")
 	}()
-	pubKey, err := h.params.tokenSigningKey.PublicKey()
+	claims, err := h.approvalVerifier.VerifyRequest(ctx, raw)
 	if err != nil {
-		return "", fmt.Errorf("PublicKey: %w", err)
+		return "", fmt.Errorf("ApprovalVerifier.VerifyRequest: %w", err)
 	}
-	token, err := jwt.Parse([]byte(raw), jwt.WithKey(jwa.RS256, pubKey))
-	if err != nil {
-		return "", fmt.Errorf("jwt.Parse: %w", err)
-	}
-	var (
-		repo           string
-		runID          int64
-		installationID int64
-	)
-	if v, ok := token.Get("repo"); ok {
-		repo, _ = v.(string)
-	}
-	if v, ok := token.Get("run_id"); ok {
-		fv, _ := v.(float64)
-		runID = int64(fv)
-	}
-	if v, ok := token.Get("installation_id"); ok {
-		fv, _ := v.(float64)
-		installationID = int64(fv)
-	}
-	logger = logger.With(zap.String("repo", repo), zap.Int64("run_id", runID), zap.Int64("installation_id", installationID))
-	if repo == "" || runID == 0 || installationID == 0 {
-		return "", errors.New("missing parameter")
-	}
+	logger = logger.With(zap.String("repo", claims.Repo), zap.Int64("run_id", claims.RunID), zap.Int64("installation_id", claims.InstallationID))
 
-	tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, installationID, []byte(h.params.GitHubAppPrivateKey))
+	tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, claims.InstallationID, []byte(h.params.GitHubAppPrivateKey))
 	if err != nil {
 		return "", fmt.Errorf("ghinstallation.New: %w", err)
 	}
@@ -353,7 +333,7 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 		"environment_name": "production", // TODO
 		"state":            "approved",
 	}
-	ghReq, err := ghClient.NewRequest(http.MethodPost, fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%d/deployment_protection_rule", repo, runID), reqBody)
+	ghReq, err := ghClient.NewRequest(http.MethodPost, fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%d/deployment_protection_rule", claims.Repo, claims.RunID), reqBody)
 	if err != nil {
 		return "", fmt.Errorf("github.Client.NewRequest: %w", err)
 	}
@@ -363,23 +343,7 @@ func (h *Handler) handleApproval(ctx context.Context, req events.LambdaFunctionU
 	}
 	logger.Info("receive response from GitHub", zap.Int("rate.limit", resp.Rate.Limit), zap.Int("rate.remaining", resp.Rate.Remaining), zap.Time("rate.reset_at", resp.Rate.Reset.Time), zap.Time("token_expiration", resp.TokenExpiration.Time))
 
-	return fmt.Sprintf("https://github.com/%s/actions/runs/%d", repo, runID), nil
-}
-
-func (h *Handler) buildTransientToken(installationID int64, repo string, runID int64) ([]byte, error) {
-	tok, err := jwt.NewBuilder().
-		Claim("repo", repo).
-		Claim("run_id", runID).
-		Claim("installation_id", installationID).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("jwt.Builder.Build: %w", err)
-	}
-	serialized, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, h.params.tokenSigningKey))
-	if err != nil {
-		return nil, fmt.Errorf("jwt.Sign: %w", err)
-	}
-	return serialized, nil
+	return fmt.Sprintf("https://github.com/%s/actions/runs/%d", claims.Repo, claims.RunID), nil
 }
 
 func parseAndValidateWebhookPayload(req events.LambdaFunctionURLRequest, secret []byte) (any, error) {
