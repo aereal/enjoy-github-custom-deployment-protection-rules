@@ -209,8 +209,6 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 			installationID int64
 			callbackURL    string
 			deployEnv      string
-			owner          string
-			repoName       string
 		)
 		fields := []zap.Field{
 			zap.Stringp("environment", payload.Environment),
@@ -244,27 +242,14 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 				zap.Stringp("deploy.description", deploy.Description),
 				zap.Int64p("deploy.id", deploy.ID))
 		}
-		if repo := payload.Repo; repo != nil {
-			if v := repo.Owner; v != nil {
-				owner = *v.Login
-			}
-			if v := repo.Name; v != nil {
-				repoName = *v
-			}
-		}
 		logger.Info("receive deployment_protection_rule event", fields...)
 		tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, installationID, []byte(h.params.GitHubAppPrivateKey))
 		if err != nil {
 			return fmt.Errorf("ghinstallation.New: %w", err)
 		}
-		runID, err := extractRunID(callbackURL)
+		approvalClaims, err := NewClaimsFromDeploymentProtectionRuleEvent(payload)
 		if err != nil {
-			return fmt.Errorf("extractRunID: %w", err)
-		}
-		approvalClaims := &approvalreq.Claims{
-			InstallationID: installationID,
-			Repo:           fmt.Sprintf("%s/%s", owner, repoName),
-			RunID:          runID,
+			return fmt.Errorf("NewClaimsFromDeploymentProtectionRuleEvent: %w", err)
 		}
 		token, err := h.approvalVerifier.IssueToken(ctx, approvalClaims)
 		if err != nil {
@@ -373,20 +358,6 @@ func parseAndValidateWebhookPayload(req events.LambdaFunctionURLRequest, secret 
 	return parsed, nil
 }
 
-func extractRunID(reviewURL string) (int64, error) {
-	parsed, err := url.Parse(reviewURL)
-	if err != nil {
-		return 0, fmt.Errorf("url.Parse: %w", err)
-	}
-	proceeding, _ := strings.CutSuffix(parsed.Path, "/deployment_protection_rule")
-	parts := strings.Split(proceeding, "/")
-	runID, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("strconv.ParseInt: %w", err)
-	}
-	return runID, nil
-}
-
 func Start() int {
 	logger, err := log.New()
 	if err != nil {
@@ -422,3 +393,30 @@ func Start() int {
 }
 
 func ref[T any](v T) *T { return &v }
+
+func NewClaimsFromDeploymentProtectionRuleEvent(payload *github.DeploymentProtectionRuleEvent) (*approvalreq.Claims, error) {
+	runID, err := extractRunID(payload.GetDeploymentCallbackURL())
+	if err != nil {
+		return nil, fmt.Errorf("extractRunID: %w", err)
+	}
+	claims := &approvalreq.Claims{
+		InstallationID: payload.GetInstallation().GetID(),
+		Repo:           payload.GetRepo().GetFullName(),
+		RunID:          runID,
+	}
+	return claims, nil
+}
+
+func extractRunID(reviewURL string) (int64, error) {
+	parsed, err := url.Parse(reviewURL)
+	if err != nil {
+		return 0, fmt.Errorf("url.Parse: %w", err)
+	}
+	proceeding, _ := strings.CutSuffix(parsed.Path, "/deployment_protection_rule")
+	parts := strings.Split(proceeding, "/")
+	runID, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return runID, nil
+}
