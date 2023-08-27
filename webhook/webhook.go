@@ -205,44 +205,24 @@ func (h *Handler) handleWebhook(ctx context.Context, req events.LambdaFunctionUR
 		// noop
 		return nil
 	case *github.DeploymentProtectionRuleEvent:
-		var (
-			installationID int64
-			callbackURL    string
-			deployEnv      string
+		callbackURL := payload.GetDeploymentCallbackURL()
+		installationID := payload.GetInstallation().GetID()
+		deployEnv := payload.GetDeployment().GetEnvironment()
+		logger.Info("receive deployment_protection_rule event",
+			zap.String("environment", payload.GetEnvironment()),
+			zap.String("action", payload.GetAction()),
+			zap.String("deployment_callback_url", callbackURL),
+			zap.Int64("installation.target_id", payload.GetInstallation().GetTargetID()),
+			zap.Int64("installation.id", installationID),
+			zap.String("installation.target_type", payload.GetInstallation().GetTargetType()),
+			zap.String("sender.login", payload.GetSender().GetLogin()),
+			zap.String("deploy.sha", payload.GetDeployment().GetSHA()),
+			zap.String("deploy.ref", payload.GetDeployment().GetRef()),
+			zap.String("deploy.task", payload.GetDeployment().GetTask()),
+			zap.String("deploy.environment", payload.GetDeployment().GetEnvironment()),
+			zap.String("deploy.description", payload.GetDeployment().GetDescription()),
+			zap.Int64("deploy.id", payload.GetDeployment().GetID()),
 		)
-		fields := []zap.Field{
-			zap.Stringp("environment", payload.Environment),
-			zap.Stringp("action", payload.Action),
-			zap.Stringp("deployment_callback_url", payload.DeploymentCallbackURL),
-		}
-		if payload.DeploymentCallbackURL != nil {
-			callbackURL = *payload.DeploymentCallbackURL
-		}
-		if inst := payload.Installation; inst != nil {
-			if inst.ID != nil {
-				installationID = *inst.ID
-			}
-			fields = append(fields,
-				zap.Int64p("installation.target_id", inst.TargetID),
-				zap.Stringp("installation.target_type", inst.TargetType),
-				zap.Int64p("installation.id", inst.ID))
-		}
-		if sender := payload.Sender; sender != nil {
-			fields = append(fields, zap.Stringp("sender.login", sender.Login))
-		}
-		if deploy := payload.Deployment; deploy != nil {
-			if deploy.Environment != nil {
-				deployEnv = *deploy.Environment
-			}
-			fields = append(fields,
-				zap.Stringp("deploy.sha", deploy.SHA),
-				zap.Stringp("deploy.ref", deploy.Ref),
-				zap.Stringp("deploy.task", deploy.Task),
-				zap.Stringp("deploy.environment", deploy.Environment),
-				zap.Stringp("deploy.description", deploy.Description),
-				zap.Int64p("deploy.id", deploy.ID))
-		}
-		logger.Info("receive deployment_protection_rule event", fields...)
 		tr, err := ghinstallation.New(otelhttp.NewTransport(nil), h.ghAppID, installationID, []byte(h.params.GitHubAppPrivateKey))
 		if err != nil {
 			return fmt.Errorf("ghinstallation.New: %w", err)
