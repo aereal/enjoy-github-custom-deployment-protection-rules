@@ -1,0 +1,16 @@
+---
+
+name: CI
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo done
+  deploy:
+    needs:
+      - test
+    uses: ./.github/workflows/deploy-app.yml
+    with:
+      group: production

@@ -1,8 +1,12 @@
 ---
 
-name: deploy demo
+name: deploy
 on:
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      group:
+        type: string
+        required: true
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -10,7 +14,7 @@ jobs:
       name: production
       url: https://github.com/aereal/enjoy-github-custom-deployment-protection-rules
     concurrency:
-      group: production
+      group: ${{ inputs.group }}
       cancel-in-progress: true
     steps:
       - run: echo 'Deployed'
